@@ -1,8 +1,10 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
 const API = 'http://127.0.0.1:8000';
+const WS_URL = 'ws://127.0.0.1:8000/ws/opportunities';
+const WS_RECONNECT_DELAY_MS = 3000;
 
 const SPORTS = [
   { key: 'baseball_mlb', label: 'MLB' },
@@ -13,6 +15,136 @@ const SPORTS = [
   { key: 'tennis_atp_wimbledon', label: 'ATP Wimbledon' },
   { key: 'tennis_wta_wimbledon', label: 'WTA Wimbledon' },
 ];
+
+const SPORT_LABELS = SPORTS.reduce((map, sport) => {
+  map[sport.key] = sport.label;
+  return map;
+}, {});
+
+const SPORTSBOOK_FALLBACK_URLS = {
+  DraftKings: "https://sportsbook.draftkings.com/",
+  FanDuel: "https://sportsbook.fanduel.com/",
+  BetMGM: "https://sports.betmgm.com/",
+  Caesars: "https://www.caesars.com/sportsbook-and-casino",
+};
+
+function formatCommenceTime(iso) {
+  const date = iso ? new Date(iso) : null;
+
+  if (!date || Number.isNaN(date.getTime())) {
+    return 'Start time TBD';
+  }
+
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+const NOTIFY_ROI_THRESHOLD = 2;
+
+function getOpportunityKey(opportunity) {
+  return `${opportunity.sport}-${opportunity.event}-${opportunity.commence_time}`;
+}
+
+function notificationsSupported() {
+  return typeof window !== 'undefined' && typeof Notification !== 'undefined';
+}
+
+function getRoiTier(roiPercent) {
+  if (roiPercent >= 2) return 'green';
+  if (roiPercent >= 1) return 'yellow';
+  return 'red';
+}
+
+function OpportunityCard({ opportunity }) {
+  const [bankroll, setBankroll] = useState(100);
+
+  const totalInverseOdds = opportunity.outcomes.reduce(
+    (total, item) => total + 1 / item.decimal_odds,
+    0
+  );
+
+  const guaranteedReturn = Number(bankroll) / totalInverseOdds;
+  const profit = guaranteedReturn - Number(bankroll);
+
+  const outcomesWithStakes = opportunity.outcomes.map((item) => ({
+    ...item,
+    stake: guaranteedReturn / item.decimal_odds,
+  }));
+
+  const commenceDate = opportunity.commence_time ? new Date(opportunity.commence_time) : null;
+  const isLive = Boolean(commenceDate && !Number.isNaN(commenceDate.getTime()) && commenceDate.getTime() <= Date.now());
+  const bookNames = opportunity.outcomes.map((item) => item.sportsbook).join(', ');
+
+  return (
+    <article className="opportunity">
+      <div>
+        <h3>{opportunity.event}</h3>
+        <p>
+          {opportunity.sport_label} · {opportunity.market}
+        </p>
+        <p className="game-time">
+          {formatCommenceTime(opportunity.commence_time)}{' '}
+          <span className={`badge badge-${isLive ? 'live' : 'upcoming'}`}>
+            {isLive ? 'LIVE' : 'UPCOMING'}
+          </span>
+        </p>
+        <p className="books-used">Books: {bookNames}</p>
+      </div>
+
+      <div className={`roi roi-${getRoiTier(opportunity.roi_percent)}`}>
+        {opportunity.roi_percent.toFixed(2)}% ROI
+      </div>
+
+      <div className="stake-calculator">
+        <label>Bankroll</label>
+        <input
+          type="number"
+          value={bankroll}
+          onChange={(event) => setBankroll(event.target.value)}
+        />
+      </div>
+
+      <div className="arb-summary">
+        <p>Bankroll: <strong>${Number(bankroll).toFixed(2)}</strong></p>
+        <p>Guaranteed Return: <strong>${guaranteedReturn.toFixed(2)}</strong></p>
+        <p>Guaranteed Profit: <strong>${profit.toFixed(2)}</strong></p>
+      </div>
+
+      {outcomesWithStakes.map((item) => {
+        // item.deep_link_url would come from the opportunity data itself (e.g. a
+        // future backend/provider field). Until that exists, fall back to the
+        // known static sportsbook URLs, then to a disabled placeholder button.
+        const linkUrl = item.deep_link_url || SPORTSBOOK_FALLBACK_URLS[item.sportsbook] || null;
+
+        return (
+          <div className="line" key={`${item.sportsbook}-${item.selection}`}>
+            <button
+              type="button"
+              className="sportsbook-btn"
+              disabled={!linkUrl}
+              title={linkUrl ? `Open ${item.sportsbook} in a new tab` : `${item.sportsbook} link coming soon`}
+              onClick={() => {
+                if (linkUrl) window.open(linkUrl, '_blank', 'noopener,noreferrer');
+              }}
+            >
+              {item.sportsbook} · {item.selection}
+            </button>
+
+            <div style={{ textAlign: "right" }}>
+              <strong>{item.decimal_odds.toFixed(2)}</strong>
+              <br />
+              <small>Bet ${item.stake.toFixed(2)}</small>
+            </div>
+          </div>
+        );
+      })}
+    </article>
+  );
+}
 
 function App() {
   const [bankroll, setBankroll] = useState(1500);
@@ -27,7 +159,46 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [hasScanned, setHasScanned] = useState(false);
   const [error, setError] = useState('');
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [wsStatus, setWsStatus] = useState('disconnected');
+  const notifiedEventsRef = useRef(new Set());
+  const [filterTeam, setFilterTeam] = useState('');
+  const [filterSport, setFilterSport] = useState('');
+  const [filterSportsbook, setFilterSportsbook] = useState('');
+  const [filterMinRoi, setFilterMinRoi] = useState('');
 
+  const filteredOpportunities = useMemo(() => {
+    const teamQuery = filterTeam.trim().toLowerCase();
+    const bookQuery = filterSportsbook.trim().toLowerCase();
+    const minRoi = filterMinRoi === '' ? null : Number(filterMinRoi);
+
+    return opportunities.filter((opportunity) => {
+      if (
+        teamQuery &&
+        !opportunity.event.toLowerCase().includes(teamQuery) &&
+        !opportunity.outcomes.some((item) => item.selection.toLowerCase().includes(teamQuery))
+      ) {
+        return false;
+      }
+
+      if (filterSport && opportunity.sport !== filterSport) {
+        return false;
+      }
+
+      if (
+        bookQuery &&
+        !opportunity.outcomes.some((item) => item.sportsbook.toLowerCase().includes(bookQuery))
+      ) {
+        return false;
+      }
+
+      if (minRoi !== null && !Number.isNaN(minRoi) && opportunity.roi_percent < minRoi) {
+        return false;
+      }
+
+      return true;
+    });
+  }, [opportunities, filterTeam, filterSport, filterSportsbook, filterMinRoi]);
   const implied = useMemo(() => {
     const a = Number(oddsA);
     const b = Number(oddsB);
@@ -94,6 +265,99 @@ function App() {
       setError(requestError.message);
     } finally {
       setLoading(false);
+    }
+  }
+  
+useEffect(() => {
+  if (!autoRefresh) {
+    setWsStatus('disconnected');
+    return;
+  }
+
+  let isActive = true;
+  let socket = null;
+  let reconnectTimer = null;
+
+  function connect() {
+    if (!isActive) return;
+
+    setWsStatus('connecting');
+    socket = new WebSocket(`${WS_URL}?minimum_roi=${minimumRoi}`);
+
+    socket.onopen = () => {
+      if (isActive) setWsStatus('live');
+    };
+
+    socket.onmessage = (event) => {
+      let data;
+
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (data.type !== 'opportunities_update') return;
+
+      const withLabels = (data.opportunities || []).map((item) => ({
+        ...item,
+        sport_label: SPORT_LABELS[item.sport] || item.sport,
+      }));
+
+      const sorted = withLabels.sort((a, b) => b.roi_percent - a.roi_percent);
+
+      if (notificationsSupported() && Notification.permission === 'granted') {
+        sorted.forEach((opportunity) => {
+          if (opportunity.roi_percent < NOTIFY_ROI_THRESHOLD) return;
+
+          const key = getOpportunityKey(opportunity);
+          if (notifiedEventsRef.current.has(key)) return;
+
+          notifiedEventsRef.current.add(key);
+
+          const bookNames = opportunity.outcomes.map((item) => item.sportsbook).join(', ');
+
+          new Notification('Arbitrage opportunity found', {
+            body: `${opportunity.event}\n${opportunity.roi_percent.toFixed(2)}% ROI · ${bookNames}`,
+          });
+        });
+      }
+
+      setOpportunities(sorted);
+      setGamesChecked(data.games_checked ?? 0);
+      setSportsScanned(data.sports_scanned ?? 0);
+      setHasScanned(true);
+    };
+
+    socket.onclose = () => {
+      if (!isActive) return;
+      setWsStatus('disconnected');
+      reconnectTimer = setTimeout(connect, WS_RECONNECT_DELAY_MS);
+    };
+
+    socket.onerror = () => {
+      socket.close();
+    };
+  }
+
+  connect();
+
+  return () => {
+    isActive = false;
+    clearTimeout(reconnectTimer);
+
+    if (socket) {
+      socket.onclose = null;
+      socket.close();
+    }
+  };
+}, [autoRefresh, minimumRoi]);
+
+  function handleAutoRefreshToggle(enabled) {
+    setAutoRefresh(enabled);
+
+    if (enabled && notificationsSupported() && Notification.permission === 'default') {
+      Notification.requestPermission();
     }
   }
 
@@ -247,11 +511,64 @@ function App() {
             <option value={5}>5%+</option>
           </select>
 
+<div style={{ marginTop: "15px", marginBottom: "15px" }}>
+  <label>
+    <input
+      type="checkbox"
+      checked={autoRefresh}
+      onChange={(e) => handleAutoRefreshToggle(e.target.checked)}
+    />
+    {' '}Auto Refresh (live)
+  </label>
+
+  {autoRefresh && (
+    <span className={`ws-status ws-status-${wsStatus}`} style={{ marginLeft: "10px" }}>
+      {wsStatus === 'connecting' && 'Connecting…'}
+      {wsStatus === 'live' && 'Live'}
+      {wsStatus === 'disconnected' && 'Disconnected — retrying…'}
+    </span>
+  )}
+</div>
           <button onClick={loadLiveOpportunities} disabled={loading}>
             {loading ? 'Scanning major sports...' : 'Scan All Major Sports'}
           </button>
 
           {error && <p className="error">{error}</p>}
+
+          <div className="filter-bar">
+            <input
+              type="text"
+              placeholder="Search team..."
+              value={filterTeam}
+              onChange={(event) => setFilterTeam(event.target.value)}
+            />
+
+            <select
+              value={filterSport}
+              onChange={(event) => setFilterSport(event.target.value)}
+            >
+              <option value="">All sports</option>
+              {SPORTS.map((sport) => (
+                <option key={sport.key} value={sport.key}>
+                  {sport.label}
+                </option>
+              ))}
+            </select>
+
+            <input
+              type="text"
+              placeholder="Search sportsbook..."
+              value={filterSportsbook}
+              onChange={(event) => setFilterSportsbook(event.target.value)}
+            />
+
+            <input
+              type="number"
+              placeholder="Min ROI %"
+              value={filterMinRoi}
+              onChange={(event) => setFilterMinRoi(event.target.value)}
+            />
+          </div>
 
           {hasScanned && opportunities.length === 0 && (
             <div className="empty-state">
@@ -263,40 +580,23 @@ function App() {
             </div>
           )}
 
-          {opportunities.map((opportunity) => (
-            <article
-              className="opportunity"
+          {opportunities.length > 0 && filteredOpportunities.length === 0 && (
+            <div className="empty-state">
+              <h3>No opportunities match your filters</h3>
+              <p>Try clearing the team, sport, sportsbook, or minimum ROI filters.</p>
+            </div>
+          )}
+
+          {filteredOpportunities.map((opportunity) => (
+            <OpportunityCard
               key={`${opportunity.sport_label}-${opportunity.event}-${opportunity.commence_time}`}
-            >
-              <div>
-                <h3>{opportunity.event}</h3>
-                <p>
-                  {opportunity.sport_label} · {opportunity.market}
-                </p>
-              </div>
-
-              <div className="roi">
-                {opportunity.roi_percent.toFixed(2)}% ROI
-              </div>
-
-              {opportunity.outcomes.map((item) => (
-                <div
-                  className="line"
-                  key={`${item.sportsbook}-${item.selection}`}
-                >
-                  <span>
-                    {item.sportsbook} · {item.selection}
-                  </span>
-
-                  <strong>{item.decimal_odds.toFixed(2)}</strong>
-                </div>
-              ))}
-            </article>
+              opportunity={opportunity}
+            />
           ))}
-        </div>
-      </section>
-    </main>
-  );
+</div>
+</section>
+</main>
+);
 }
 
 createRoot(document.getElementById('root')).render(<App />);

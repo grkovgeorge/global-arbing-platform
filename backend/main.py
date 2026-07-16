@@ -1,9 +1,11 @@
+import asyncio
 import os
+from datetime import datetime, timezone
 from typing import List
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -13,11 +15,45 @@ app = FastAPI(title="Arbing App API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Same sport list the frontend scans on "Scan All Major Sports" / the live
+# WebSocket feed, so both paths cover identical markets.
+LIVE_SPORTS = [
+    "baseball_mlb",
+    "basketball_nba",
+    "americanfootball_nfl",
+    "icehockey_nhl",
+    "soccer_usa_mls",
+    "tennis_atp_wimbledon",
+    "tennis_wta_wimbledon",
+]
+
+# Temporary fixed interval for Phase 1 WebSocket testing.
+WS_UPDATE_INTERVAL_SECONDS = 10
+
+QUOTA_EXHAUSTED_MESSAGE = "Odds API quota exhausted. Live scanning is temporarily unavailable."
+
+
+def _is_quota_exhausted(response: httpx.Response) -> bool:
+    try:
+        return response.json().get("error_code") == "OUT_OF_USAGE_CREDITS"
+    except ValueError:
+        return False
+
+
+# Shared in-memory cache populated by the single background fetch loop.
+# All WebSocket clients read from this instead of each fetching independently.
+_opportunities_cache = None
+_cache_ready_event = asyncio.Event()
+_background_task = None
 
 
 class Outcome(BaseModel):
@@ -74,11 +110,12 @@ def sample_opportunities():
     ]
 
 
-@app.get("/live-opportunities")
-async def live_opportunities(
-    sport: str = "baseball_mlb",
-    minimum_roi: float = 0.0,
-):
+async def fetch_live_opportunities(sport: str, minimum_roi: float = 0.0) -> dict:
+    """Fetch odds for one sport and compute arbitrage opportunities.
+
+    Shared by GET /live-opportunities and WS /ws/opportunities so both
+    surfaces run the exact same calculation logic.
+    """
     api_key = os.getenv("ODDS_API_KEY")
 
     if not api_key:
@@ -101,6 +138,12 @@ async def live_opportunities(
         response = await client.get(url, params=params)
 
     if response.status_code != 200:
+        if _is_quota_exhausted(response):
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=QUOTA_EXHAUSTED_MESSAGE,
+            )
+
         raise HTTPException(
             status_code=response.status_code,
             detail=f"Odds provider error: {response.text}",
@@ -178,6 +221,110 @@ async def live_opportunities(
         "opportunities_found": len(opportunities),
         "opportunities": opportunities,
     }
+
+
+@app.get("/live-opportunities")
+async def live_opportunities(
+    sport: str = "baseball_mlb",
+    minimum_roi: float = 0.0,
+):
+    return await fetch_live_opportunities(sport, minimum_roi)
+
+
+async def fetch_all_sports_opportunities(minimum_roi: float = 0.0) -> dict:
+    """Fan out fetch_live_opportunities across every sport the dashboard
+    tracks, merge the results, and sort by ROI. Used by the WebSocket feed
+    so it mirrors what "Scan All Major Sports" does over REST today.
+    """
+    results = await asyncio.gather(
+        *(fetch_live_opportunities(sport, minimum_roi) for sport in LIVE_SPORTS),
+        return_exceptions=True,
+    )
+
+    all_opportunities = []
+    games_checked_total = 0
+    sports_scanned = 0
+    quota_exhausted_logged = False
+
+    for sport, result in zip(LIVE_SPORTS, results):
+        if isinstance(result, BaseException):
+            if isinstance(result, HTTPException) and result.detail == QUOTA_EXHAUSTED_MESSAGE:
+                if not quota_exhausted_logged:
+                    print(f"[ws] {QUOTA_EXHAUSTED_MESSAGE}")
+                    quota_exhausted_logged = True
+            else:
+                print(f"[ws] failed to fetch {sport}: {result}")
+            continue
+
+        sports_scanned += 1
+        games_checked_total += result["games_checked"]
+        all_opportunities.extend(result["opportunities"])
+
+    all_opportunities.sort(key=lambda item: item["roi_percent"], reverse=True)
+
+    return {
+        "opportunities": all_opportunities,
+        "games_checked": games_checked_total,
+        "sports_scanned": sports_scanned,
+    }
+
+
+async def _refresh_opportunities_cache():
+    """The one and only place that actually calls the provider. Runs once
+    for the whole process; every WS client just reads the cached result.
+    """
+    global _opportunities_cache
+
+    while True:
+        _opportunities_cache = await fetch_all_sports_opportunities()
+        _cache_ready_event.set()
+        await asyncio.sleep(WS_UPDATE_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def _start_background_fetch_loop():
+    global _background_task
+    _background_task = asyncio.create_task(_refresh_opportunities_cache())
+
+
+@app.websocket("/ws/opportunities")
+async def ws_opportunities(websocket: WebSocket, minimum_roi: float = 0.0):
+    await websocket.accept()
+
+    await websocket.send_json(
+        {
+            "type": "connected",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": "WebSocket connection established.",
+        }
+    )
+
+    try:
+        await _cache_ready_event.wait()
+
+        while True:
+            snapshot = _opportunities_cache
+            opportunities = [
+                item for item in snapshot["opportunities"]
+                if item["roi_percent"] >= minimum_roi
+            ]
+
+            await websocket.send_json(
+                {
+                    "type": "opportunities_update",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "opportunities": opportunities,
+                    "opportunity_count": len(opportunities),
+                    "games_checked": snapshot["games_checked"],
+                    "sports_scanned": snapshot["sports_scanned"],
+                }
+            )
+
+            await asyncio.sleep(WS_UPDATE_INTERVAL_SECONDS)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[ws] unexpected error, closing connection: {exc}")
 
 
 @app.post("/calculate-arbitrage")

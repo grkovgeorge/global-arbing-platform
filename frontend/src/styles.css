@@ -34,8 +34,36 @@ button { width: 100%; border: 0; border-radius: 12px; padding: 14px 18px; backgr
 .opportunity p { margin: 5px 0 12px; color: #8390b5; }
 .roi { display: inline-block; margin-bottom: 8px; color: #7be2b4; font-weight: 800; }
 .error { color: #ff9a9a; }
+.ws-status { font-size: 13px; font-weight: 700; }
+.ws-status-live { color: #7be2b4; }
+.ws-status-connecting { color: #ffd28a; }
+.ws-status-disconnected { color: #ff9a9a; }
+.game-time { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.books-used { font-size: 13px; }
+.badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: .04em; }
+.badge-live { background: rgba(255,99,99,.15); border: 1px solid rgba(255,99,99,.4); color: #ff9a9a; }
+.badge-upcoming { background: rgba(96,165,250,.15); border: 1px solid rgba(96,165,250,.4); color: #8ab4fa; }
+.roi-green { color: #7be2b4; }
+.roi-yellow { color: #ffd28a; }
+.roi-red { color: #ff9a9a; }
+.filter-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0; }
+.filter-bar input, .filter-bar select {
+  width: 100%; padding: 11px 12px; background: #0b1226; border: 1px solid #2b365b;
+  border-radius: 12px; color: white; outline: none; font: inherit;
+}
+.filter-bar input:focus, .filter-bar select:focus { border-color: #7be2b4; }
+.sportsbook-btn {
+  width: auto; text-align: left; background: rgba(255,255,255,.04);
+  border: 1px solid rgba(255,255,255,.14); color: #f7f8fb; padding: 8px 12px;
+  border-radius: 10px; font-weight: 600; font-size: 14px; cursor: pointer;
+}
+.sportsbook-btn:hover:not(:disabled) { border-color: #7be2b4; color: #7be2b4; }
+.sportsbook-btn:disabled { opacity: .55; cursor: not-allowed; }
+.stake-calculator { max-width: 200px; margin: 6px 0 14px; }
+.stake-calculator label { margin: 0 0 6px; }
 @media (max-width: 800px) {
   .grid { grid-template-columns: 1fr; }
   .hero { flex-direction: column; }
   .odds-grid, .stats { grid-template-columns: 1fr; }
+  .filter-bar { grid-template-columns: 1fr 1fr; }
 }
