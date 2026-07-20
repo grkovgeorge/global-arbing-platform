@@ -109,14 +109,32 @@ function getRoiTier(roiPercent) {
   return 'red';
 }
 
-function OpportunityCard({ opportunity }) {
-  const [bankroll, setBankroll] = useState(100);
-  const [now, setNow] = useState(() => Date.now());
+// Issue #7: applies only to live WebSocket/Auto Refresh data. Manual REST
+// scan results are a static snapshot and are never subject to this.
+const FRESHNESS_TICK_MS = 1000;
+const FRESH_THRESHOLD_SECONDS = 10;
+const DELAYED_THRESHOLD_SECONDS = 20;
+const STALE_THRESHOLD_SECONDS = 25;
 
-  useEffect(() => {
-    const interval = setInterval(() => setNow(Date.now()), 30000);
-    return () => clearInterval(interval);
-  }, []);
+// 'fresh' (0-10s) -> 'delayed' (10-20s) -> 'stale' (20-25s) -> 'expired'
+// (>25s, removed from the live view entirely by the caller).
+function getFreshnessStatus(lastUpdatedIso, now) {
+  const lastUpdated = lastUpdatedIso ? new Date(lastUpdatedIso).getTime() : NaN;
+
+  if (Number.isNaN(lastUpdated)) {
+    return null;
+  }
+
+  const ageSeconds = (now - lastUpdated) / 1000;
+
+  if (ageSeconds <= FRESH_THRESHOLD_SECONDS) return 'fresh';
+  if (ageSeconds <= DELAYED_THRESHOLD_SECONDS) return 'delayed';
+  if (ageSeconds <= STALE_THRESHOLD_SECONDS) return 'stale';
+  return 'expired';
+}
+
+function OpportunityCard({ opportunity, now, isLiveFeed }) {
+  const [bankroll, setBankroll] = useState(100);
 
   const totalInverseOdds = opportunity.outcomes.reduce(
     (total, item) => total + 1 / item.decimal_odds,
@@ -138,8 +156,15 @@ function OpportunityCard({ opportunity }) {
   const countdownText = !isLive && hasValidCommenceDate ? getCountdownText(commenceDate, now) : null;
   const bookNames = opportunity.outcomes.map((item) => item.sportsbook).join(', ');
 
+  // Manual REST scan results are a static snapshot and never go stale —
+  // freshness only applies to opportunities that came from the live feed.
+  const freshnessStatus = isLiveFeed ? getFreshnessStatus(opportunity.last_updated, now) : null;
+  const freshnessAgeSeconds = freshnessStatus
+    ? Math.max(0, Math.floor((now - new Date(opportunity.last_updated).getTime()) / 1000))
+    : null;
+
   return (
-    <article className="opportunity">
+    <article className={`opportunity ${freshnessStatus === 'stale' ? 'opportunity-stale' : ''}`}>
       <div>
         <h3>{opportunity.event}</h3>
         <p>
@@ -162,6 +187,14 @@ function OpportunityCard({ opportunity }) {
           </span>
         </p>
         {countdownText && <p className="countdown">{countdownText}</p>}
+        {freshnessStatus && (
+          <p className="freshness">
+            <span className={`badge badge-freshness-${freshnessStatus}`}>
+              {freshnessStatus.toUpperCase()}
+            </span>
+            {' '}Updated {freshnessAgeSeconds} sec ago
+          </p>
+        )}
         <p className="books-used">Books: {bookNames}</p>
       </div>
 
@@ -248,6 +281,20 @@ function App() {
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [wsStatus, setWsStatus] = useState('disconnected');
   const notifiedEventsRef = useRef(new Set());
+  // 'manual' (static REST scan, never expires) or 'live' (WS/Auto Refresh,
+  // subject to freshness/staleness). Tracks which source last populated
+  // `opportunities`, since both paths share the same state (Issue #7).
+  const [dataSource, setDataSource] = useState(null);
+
+  // One shared clock for the whole app — feeds both the freshness feature
+  // and OpportunityCard's LIVE/countdown display. A single interval here
+  // instead of one per card; cleaned up on unmount via the effect return.
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), FRESHNESS_TICK_MS);
+    return () => clearInterval(interval);
+  }, []);
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [notifyMinRoi, setNotifyMinRoi] = useState(NOTIFY_ROI_THRESHOLD);
   const notificationsEnabledRef = useRef(notificationsEnabled);
@@ -295,6 +342,12 @@ function App() {
         return false;
       }
 
+      // Manual REST scans are a static snapshot and never auto-expire —
+      // staleness removal only applies to the live WS/Auto Refresh feed.
+      if (dataSource === 'live' && getFreshnessStatus(opportunity.last_updated, now) === 'expired') {
+        return false;
+      }
+
       return true;
     });
 
@@ -303,7 +356,7 @@ function App() {
         ? a.roi_percent - b.roi_percent
         : b.roi_percent - a.roi_percent
     ));
-  }, [opportunities, filterTeam, filterSport, filterSportsbook, filterMinRoi, roiSortDirection]);
+  }, [opportunities, filterTeam, filterSport, filterSportsbook, filterMinRoi, roiSortDirection, dataSource, now]);
   const implied = useMemo(() => {
     const a = Number(oddsA);
     const b = Number(oddsB);
@@ -361,6 +414,7 @@ function App() {
         successful.reduce((total, item) => total + item.gamesChecked, 0)
       );
       setOpportunities(allOpportunities);
+      setDataSource('manual');
       setHasScanned(true);
 
       if (failures.length > 0) {
@@ -425,6 +479,12 @@ useEffect(() => {
         sorted.forEach((opportunity) => {
           if (opportunity.roi_percent < threshold) return;
 
+          // Explicit staleness guard (Issue #7): only ever notify for data
+          // that is fresh at the moment this message is processed, not just
+          // "arrived over the WS" — an implicit assumption isn't the same
+          // guarantee as an explicit check for a named acceptance criterion.
+          if (getFreshnessStatus(opportunity.last_updated, Date.now()) !== 'fresh') return;
+
           const key = getOpportunityKey(opportunity);
           if (notifiedEventsRef.current.has(key)) return;
 
@@ -439,6 +499,7 @@ useEffect(() => {
       }
 
       setOpportunities(sorted);
+      setDataSource('live');
       setGamesChecked(data.games_checked ?? 0);
       setSportsScanned(data.sports_scanned ?? 0);
       setHasScanned(true);
@@ -747,6 +808,8 @@ useEffect(() => {
             <OpportunityCard
               key={`${opportunity.sport_label}-${opportunity.event}-${opportunity.commence_time}`}
               opportunity={opportunity}
+              now={now}
+              isLiveFeed={dataSource === 'live'}
             />
           ))}
 </div>

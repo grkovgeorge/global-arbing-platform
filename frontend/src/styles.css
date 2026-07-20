@@ -65,6 +65,11 @@ button { width: 100%; border: 0; border-radius: 12px; padding: 14px 18px; backgr
 .notification-settings { margin-bottom: 15px; }
 .notify-roi-label { display: inline-flex; align-items: center; gap: 6px; margin: 10px 0 0 16px; }
 .notify-roi-label input { width: 70px; }
+.freshness { font-size: 13px; }
+.badge-freshness-fresh { background: rgba(123,226,180,.12); border: 1px solid rgba(123,226,180,.35); color: #7be2b4; }
+.badge-freshness-delayed { background: rgba(255,186,73,.12); border: 1px solid rgba(255,186,73,.35); color: #ffd28a; }
+.badge-freshness-stale { background: rgba(131,144,181,.12); border: 1px solid rgba(131,144,181,.35); color: #8390b5; }
+.opportunity-stale { opacity: .55; }
 @media (max-width: 800px) {
   .grid { grid-template-columns: 1fr; }
   .hero { flex-direction: column; }

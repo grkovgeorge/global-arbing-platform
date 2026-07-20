@@ -54,6 +54,21 @@ def _is_quota_exhausted(response: httpx.Response) -> bool:
         return False
 
 
+def _stamp_last_updated(opportunities: list) -> list:
+    """Attach one shared UTC timestamp to every opportunity in this fetch
+    cycle (Issue #7). A single timestamp per call, not per-opportunity, so
+    everything produced by the same fetch reads as equally fresh. Mutates
+    the list in place — always called on a freshly-built, not-yet-published
+    list, never on anything already handed to a client.
+    """
+    last_updated = datetime.now(timezone.utc).isoformat()
+
+    for item in opportunities:
+        item["last_updated"] = last_updated
+
+    return opportunities
+
+
 # Shared in-memory cache populated by the single background fetch loop.
 # All WebSocket clients read from this instead of each fetching independently.
 _opportunities_cache = None
@@ -234,16 +249,21 @@ async def live_opportunities(
     minimum_roi: float = 0.0,
 ):
     if not DEMO_MODE_ENABLED:
-        return await fetch_live_opportunities(sport, minimum_roi)
+        result = await fetch_live_opportunities(sport, minimum_roi)
+        _stamp_last_updated(result["opportunities"])
+        return result
 
     try:
-        return await fetch_live_opportunities(sport, minimum_roi)
+        result = await fetch_live_opportunities(sport, minimum_roi)
+        _stamp_last_updated(result["opportunities"])
+        return result
     except HTTPException:
         print(f"[demo] {sport} fetch failed entirely — serving demo opportunities.")
         demo_opportunities = [
             item for item in build_demo_opportunities()
             if item["sport"] == sport and item["roi_percent"] >= minimum_roi
         ]
+        _stamp_last_updated(demo_opportunities)
 
         return {
             "sport": sport,
@@ -389,6 +409,7 @@ async def _refresh_opportunities_cache():
                 "sports_scanned": len(LIVE_SPORTS),
             }
 
+        _stamp_last_updated(snapshot["opportunities"])
         _opportunities_cache = snapshot
         _cache_ready_event.set()
         await asyncio.sleep(WS_UPDATE_INTERVAL_SECONDS)
