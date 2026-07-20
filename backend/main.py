@@ -1,6 +1,6 @@
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 import httpx
@@ -41,12 +41,32 @@ WS_UPDATE_INTERVAL_SECONDS = 10
 
 QUOTA_EXHAUSTED_MESSAGE = "Odds API quota exhausted. Live scanning is temporarily unavailable."
 
+# Off by default so a real provider outage in production never silently
+# starts serving fake data — a developer must explicitly opt in locally,
+# e.g. `DEMO_MODE_ENABLED=true` in backend/.env, to allow the fallback below.
+DEMO_MODE_ENABLED = os.getenv("DEMO_MODE_ENABLED", "false").strip().lower() == "true"
+
 
 def _is_quota_exhausted(response: httpx.Response) -> bool:
     try:
         return response.json().get("error_code") == "OUT_OF_USAGE_CREDITS"
     except ValueError:
         return False
+
+
+def _stamp_last_updated(opportunities: list) -> list:
+    """Attach one shared UTC timestamp to every opportunity in this fetch
+    cycle (Issue #7). A single timestamp per call, not per-opportunity, so
+    everything produced by the same fetch reads as equally fresh. Mutates
+    the list in place — always called on a freshly-built, not-yet-published
+    list, never on anything already handed to a client.
+    """
+    last_updated = datetime.now(timezone.utc).isoformat()
+
+    for item in opportunities:
+        item["last_updated"] = last_updated
+
+    return opportunities
 
 
 # Shared in-memory cache populated by the single background fetch loop.
@@ -228,7 +248,29 @@ async def live_opportunities(
     sport: str = "baseball_mlb",
     minimum_roi: float = 0.0,
 ):
-    return await fetch_live_opportunities(sport, minimum_roi)
+    if not DEMO_MODE_ENABLED:
+        result = await fetch_live_opportunities(sport, minimum_roi)
+        _stamp_last_updated(result["opportunities"])
+        return result
+
+    try:
+        result = await fetch_live_opportunities(sport, minimum_roi)
+        _stamp_last_updated(result["opportunities"])
+        return result
+    except HTTPException:
+        print(f"[demo] {sport} fetch failed entirely — serving demo opportunities.")
+        demo_opportunities = [
+            item for item in build_demo_opportunities()
+            if item["sport"] == sport and item["roi_percent"] >= minimum_roi
+        ]
+        _stamp_last_updated(demo_opportunities)
+
+        return {
+            "sport": sport,
+            "games_checked": 6,
+            "opportunities_found": len(demo_opportunities),
+            "opportunities": demo_opportunities,
+        }
 
 
 async def fetch_all_sports_opportunities(minimum_roi: float = 0.0) -> dict:
@@ -269,6 +311,83 @@ async def fetch_all_sports_opportunities(minimum_roi: float = 0.0) -> dict:
     }
 
 
+def _build_demo_opportunity(event, sport, market, commence_time, outcomes):
+    # Same implied-probability/ROI formula as fetch_live_opportunities, so
+    # demo odds are internally consistent (a real arbitrage, not just
+    # decorative numbers) rather than hand-typed, possibly-wrong values.
+    implied_total = sum(1 / outcome["decimal_odds"] for outcome in outcomes)
+    roi_percent = ((1 / implied_total) - 1) * 100
+
+    return {
+        "event": event,
+        "sport": sport,
+        "commence_time": commence_time.isoformat(),
+        "market": market,
+        "implied_probability_total": round(implied_total * 100, 3),
+        "roi_percent": round(roi_percent, 3),
+        "outcomes": outcomes,
+        "is_demo": True,
+    }
+
+
+def build_demo_opportunities() -> list:
+    """Realistic sample opportunities for local development, spanning the
+    exact scenarios needed to visually test status badges/countdown/sorting:
+    one LIVE game and upcoming games at +12m, +45m, +26h ("tomorrow"), +3d.
+
+    Only ever called when DEMO_MODE_ENABLED is set and the real provider
+    fetch has failed entirely (see _refresh_opportunities_cache and
+    /live-opportunities below) — never touches the normal success path.
+    """
+    now = datetime.now(timezone.utc)
+
+    demo = [
+        _build_demo_opportunity(
+            "New York Yankees vs Boston Red Sox", "baseball_mlb", "Moneyline",
+            now - timedelta(minutes=20),
+            [
+                {"sportsbook": "DraftKings", "selection": "New York Yankees", "decimal_odds": 2.18},
+                {"sportsbook": "FanDuel", "selection": "Boston Red Sox", "decimal_odds": 2.05},
+            ],
+        ),
+        _build_demo_opportunity(
+            "Los Angeles Lakers vs Golden State Warriors", "basketball_nba", "Moneyline",
+            now + timedelta(minutes=12),
+            [
+                {"sportsbook": "BetMGM", "selection": "Los Angeles Lakers", "decimal_odds": 2.02},
+                {"sportsbook": "Caesars", "selection": "Golden State Warriors", "decimal_odds": 2.04},
+            ],
+        ),
+        _build_demo_opportunity(
+            "Kansas City Chiefs vs Buffalo Bills", "americanfootball_nfl", "Moneyline",
+            now + timedelta(minutes=45),
+            [
+                {"sportsbook": "DraftKings", "selection": "Kansas City Chiefs", "decimal_odds": 2.15},
+                {"sportsbook": "FanDuel", "selection": "Buffalo Bills", "decimal_odds": 2.05},
+            ],
+        ),
+        _build_demo_opportunity(
+            "Toronto Maple Leafs vs Montreal Canadiens", "icehockey_nhl", "Moneyline",
+            now + timedelta(hours=26),
+            [
+                {"sportsbook": "FanDuel", "selection": "Toronto Maple Leafs", "decimal_odds": 1.98},
+                {"sportsbook": "BetMGM", "selection": "Montreal Canadiens", "decimal_odds": 2.05},
+            ],
+        ),
+        _build_demo_opportunity(
+            "Novak Djokovic vs Carlos Alcaraz", "tennis_atp_wimbledon", "Moneyline",
+            now + timedelta(days=3),
+            [
+                {"sportsbook": "DraftKings", "selection": "Novak Djokovic", "decimal_odds": 2.10},
+                {"sportsbook": "Caesars", "selection": "Carlos Alcaraz", "decimal_odds": 2.12},
+            ],
+        ),
+    ]
+
+    demo.sort(key=lambda item: item["roi_percent"], reverse=True)
+    return demo
+
+
 async def _refresh_opportunities_cache():
     """The one and only place that actually calls the provider. Runs once
     for the whole process; every WS client just reads the cached result.
@@ -276,7 +395,22 @@ async def _refresh_opportunities_cache():
     global _opportunities_cache
 
     while True:
-        _opportunities_cache = await fetch_all_sports_opportunities()
+        snapshot = await fetch_all_sports_opportunities()
+
+        # sports_scanned == 0 means every single sport's fetch raised (e.g.
+        # quota exhausted) — a total provider failure, not "no arbitrage
+        # right now" (that's games_checked > 0 with an empty opportunities
+        # list, which is normal and must keep showing real empty results).
+        if DEMO_MODE_ENABLED and snapshot["sports_scanned"] == 0:
+            print("[demo] Provider fetch failed entirely — serving demo opportunities.")
+            snapshot = {
+                "opportunities": build_demo_opportunities(),
+                "games_checked": 42,
+                "sports_scanned": len(LIVE_SPORTS),
+            }
+
+        _stamp_last_updated(snapshot["opportunities"])
+        _opportunities_cache = snapshot
         _cache_ready_event.set()
         await asyncio.sleep(WS_UPDATE_INTERVAL_SECONDS)
 
