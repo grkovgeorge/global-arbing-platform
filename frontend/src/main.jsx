@@ -28,19 +28,69 @@ const SPORTSBOOK_FALLBACK_URLS = {
   Caesars: "https://www.caesars.com/sportsbook-and-casino",
 };
 
-function formatCommenceTime(iso) {
+// Odds providers surface many more US sportsbooks than the handful of exact
+// URLs above, and that list changes over time (rebrands, new market
+// entrants). Rather than hand-maintaining a long, easily-stale list of
+// homepage URLs, any sportsbook not in the curated map above still gets a
+// working, name-specific search link instead of a dead end.
+function getSportsbookSearchUrl(sportsbookName) {
+  if (!sportsbookName) {
+    return null;
+  }
+
+  const query = `${sportsbookName} sportsbook bet now`;
+  return `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+}
+
+function getGameDateTime(iso) {
   const date = iso ? new Date(iso) : null;
 
   if (!date || Number.isNaN(date.getTime())) {
-    return 'Start time TBD';
+    return null;
   }
 
-  return date.toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  });
+  return {
+    weekday: date.toLocaleDateString(undefined, { weekday: 'long' }),
+    time: date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }),
+  };
+}
+
+// Duration-based (not calendar-day-based): a game less than 24h out always
+// shows hours/minutes, so this can't be thrown off by timezone/DST edges
+// around midnight.
+function getCountdownText(commenceDate, now) {
+  const diffMs = commenceDate.getTime() - now;
+
+  if (diffMs <= 0) {
+    return null;
+  }
+
+  const diffMinutes = Math.floor(diffMs / 60000);
+
+  if (diffMinutes < 1) {
+    return 'Starts in <1m';
+  }
+
+  if (diffMinutes < 60) {
+    return `Starts in ${diffMinutes}m`;
+  }
+
+  const diffHours = Math.floor(diffMinutes / 60);
+  const remainderMinutes = diffMinutes % 60;
+
+  if (diffHours < 24) {
+    return remainderMinutes > 0
+      ? `Starts in ${diffHours}h ${remainderMinutes}m`
+      : `Starts in ${diffHours}h`;
+  }
+
+  const diffDays = Math.floor(diffHours / 24);
+
+  if (diffDays === 1) {
+    return 'Starts Tomorrow';
+  }
+
+  return `Starts in ${diffDays} days`;
 }
 
 const NOTIFY_ROI_THRESHOLD = 2;
@@ -54,13 +104,19 @@ function notificationsSupported() {
 }
 
 function getRoiTier(roiPercent) {
-  if (roiPercent >= 2) return 'green';
-  if (roiPercent >= 1) return 'yellow';
+  if (roiPercent > 4) return 'green';
+  if (roiPercent >= 2) return 'yellow';
   return 'red';
 }
 
 function OpportunityCard({ opportunity }) {
   const [bankroll, setBankroll] = useState(100);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const totalInverseOdds = opportunity.outcomes.reduce(
     (total, item) => total + 1 / item.decimal_odds,
@@ -76,7 +132,10 @@ function OpportunityCard({ opportunity }) {
   }));
 
   const commenceDate = opportunity.commence_time ? new Date(opportunity.commence_time) : null;
-  const isLive = Boolean(commenceDate && !Number.isNaN(commenceDate.getTime()) && commenceDate.getTime() <= Date.now());
+  const hasValidCommenceDate = Boolean(commenceDate && !Number.isNaN(commenceDate.getTime()));
+  const isLive = Boolean(hasValidCommenceDate && commenceDate.getTime() <= now);
+  const gameDateTime = getGameDateTime(opportunity.commence_time);
+  const countdownText = !isLive && hasValidCommenceDate ? getCountdownText(commenceDate, now) : null;
   const bookNames = opportunity.outcomes.map((item) => item.sportsbook).join(', ');
 
   return (
@@ -87,11 +146,22 @@ function OpportunityCard({ opportunity }) {
           {opportunity.sport_label} · {opportunity.market}
         </p>
         <p className="game-time">
-          {formatCommenceTime(opportunity.commence_time)}{' '}
+          <span>
+            {gameDateTime ? (
+              <>
+                {gameDateTime.weekday}
+                <br />
+                {gameDateTime.time}
+              </>
+            ) : (
+              'Start time TBD'
+            )}
+          </span>
           <span className={`badge badge-${isLive ? 'live' : 'upcoming'}`}>
             {isLive ? 'LIVE' : 'UPCOMING'}
           </span>
         </p>
+        {countdownText && <p className="countdown">{countdownText}</p>}
         <p className="books-used">Books: {bookNames}</p>
       </div>
 
@@ -116,17 +186,33 @@ function OpportunityCard({ opportunity }) {
 
       {outcomesWithStakes.map((item) => {
         // item.deep_link_url would come from the opportunity data itself (e.g. a
-        // future backend/provider field). Until that exists, fall back to the
-        // known static sportsbook URLs, then to a disabled placeholder button.
-        const linkUrl = item.deep_link_url || SPORTSBOOK_FALLBACK_URLS[item.sportsbook] || null;
+        // future backend/provider field). Next, the small curated map of exact,
+        // verified homepage URLs. Anything else still gets a working
+        // name-specific search link rather than a dead button.
+        const exactUrl = item.deep_link_url || SPORTSBOOK_FALLBACK_URLS[item.sportsbook] || null;
+        const linkUrl = exactUrl || getSportsbookSearchUrl(item.sportsbook);
+
+        // No per-outcome id/outcome_id exists in the data (backend never
+        // sends one). sportsbook+selection alone can't distinguish two rows
+        // for the same book/team at different lines/markets, so combine in
+        // the opportunity's market (available in this component's scope)
+        // and the outcome's own decimal_odds for a more collision-resistant
+        // key, without inventing a field the backend doesn't provide.
+        const outcomeKey = `${item.sportsbook}-${item.selection}-${opportunity.market}-${item.decimal_odds}`;
 
         return (
-          <div className="line" key={`${item.sportsbook}-${item.selection}`}>
+          <div className="line" key={outcomeKey}>
             <button
               type="button"
               className="sportsbook-btn"
               disabled={!linkUrl}
-              title={linkUrl ? `Open ${item.sportsbook} in a new tab` : `${item.sportsbook} link coming soon`}
+              title={
+                linkUrl
+                  ? exactUrl
+                    ? `Open ${item.sportsbook} in a new tab`
+                    : `Search for ${item.sportsbook}`
+                  : `${item.sportsbook} link unavailable`
+              }
               onClick={() => {
                 if (linkUrl) window.open(linkUrl, '_blank', 'noopener,noreferrer');
               }}
@@ -162,17 +248,30 @@ function App() {
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [wsStatus, setWsStatus] = useState('disconnected');
   const notifiedEventsRef = useRef(new Set());
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [notifyMinRoi, setNotifyMinRoi] = useState(NOTIFY_ROI_THRESHOLD);
+  const notificationsEnabledRef = useRef(notificationsEnabled);
+  const notifyMinRoiRef = useRef(notifyMinRoi);
+
+  useEffect(() => {
+    notificationsEnabledRef.current = notificationsEnabled;
+  }, [notificationsEnabled]);
+
+  useEffect(() => {
+    notifyMinRoiRef.current = notifyMinRoi;
+  }, [notifyMinRoi]);
   const [filterTeam, setFilterTeam] = useState('');
   const [filterSport, setFilterSport] = useState('');
   const [filterSportsbook, setFilterSportsbook] = useState('');
   const [filterMinRoi, setFilterMinRoi] = useState('');
+  const [roiSortDirection, setRoiSortDirection] = useState('desc');
 
   const filteredOpportunities = useMemo(() => {
     const teamQuery = filterTeam.trim().toLowerCase();
     const bookQuery = filterSportsbook.trim().toLowerCase();
     const minRoi = filterMinRoi === '' ? null : Number(filterMinRoi);
 
-    return opportunities.filter((opportunity) => {
+    const matched = opportunities.filter((opportunity) => {
       if (
         teamQuery &&
         !opportunity.event.toLowerCase().includes(teamQuery) &&
@@ -198,7 +297,13 @@ function App() {
 
       return true;
     });
-  }, [opportunities, filterTeam, filterSport, filterSportsbook, filterMinRoi]);
+
+    return matched.sort((a, b) => (
+      roiSortDirection === 'asc'
+        ? a.roi_percent - b.roi_percent
+        : b.roi_percent - a.roi_percent
+    ));
+  }, [opportunities, filterTeam, filterSport, filterSportsbook, filterMinRoi, roiSortDirection]);
   const implied = useMemo(() => {
     const a = Number(oddsA);
     const b = Number(oddsB);
@@ -306,9 +411,19 @@ useEffect(() => {
 
       const sorted = withLabels.sort((a, b) => b.roi_percent - a.roi_percent);
 
-      if (notificationsSupported() && Notification.permission === 'granted') {
+      if (notificationsEnabledRef.current && notificationsSupported() && Notification.permission === 'granted') {
+        const rawThreshold = notifyMinRoiRef.current;
+        const parsedThreshold = Number(rawThreshold);
+        // Falls back to the default threshold on empty/invalid input instead
+        // of using NaN, which previously made every "< threshold" comparison
+        // false and silently suppressed ALL notifications until the user
+        // happened to retype a valid number.
+        const threshold = rawThreshold === '' || Number.isNaN(parsedThreshold)
+          ? NOTIFY_ROI_THRESHOLD
+          : parsedThreshold;
+
         sorted.forEach((opportunity) => {
-          if (opportunity.roi_percent < NOTIFY_ROI_THRESHOLD) return;
+          if (opportunity.roi_percent < threshold) return;
 
           const key = getOpportunityKey(opportunity);
           if (notifiedEventsRef.current.has(key)) return;
@@ -355,6 +470,14 @@ useEffect(() => {
 
   function handleAutoRefreshToggle(enabled) {
     setAutoRefresh(enabled);
+
+    if (enabled && notificationsSupported() && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }
+
+  function handleNotificationsToggle(enabled) {
+    setNotificationsEnabled(enabled);
 
     if (enabled && notificationsSupported() && Notification.permission === 'default') {
       Notification.requestPermission();
@@ -529,6 +652,31 @@ useEffect(() => {
     </span>
   )}
 </div>
+
+<div className="notification-settings">
+  <label>
+    <input
+      type="checkbox"
+      checked={notificationsEnabled}
+      onChange={(e) => handleNotificationsToggle(e.target.checked)}
+    />
+    {' '}Enable browser notifications
+  </label>
+
+  {notificationsEnabled && (
+    <label className="notify-roi-label">
+      Notify at ROI ≥
+      <input
+        type="number"
+        step="0.1"
+        min="0"
+        value={notifyMinRoi}
+        onChange={(e) => setNotifyMinRoi(e.target.value)}
+      />
+      %
+    </label>
+  )}
+</div>
           <button onClick={loadLiveOpportunities} disabled={loading}>
             {loading ? 'Scanning major sports...' : 'Scan All Major Sports'}
           </button>
@@ -568,6 +716,14 @@ useEffect(() => {
               value={filterMinRoi}
               onChange={(event) => setFilterMinRoi(event.target.value)}
             />
+
+            <select
+              value={roiSortDirection}
+              onChange={(event) => setRoiSortDirection(event.target.value)}
+            >
+              <option value="desc">Highest ROI first</option>
+              <option value="asc">Lowest ROI first</option>
+            </select>
           </div>
 
           {hasScanned && opportunities.length === 0 && (
